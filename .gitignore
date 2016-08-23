@@ -1,0 +1,8 @@
+*.pdf
+*.pkl
+*.kto
+*.log
+# PyCharm directories
+.idea/
+__pycache__/
+
