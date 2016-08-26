@@ -127,18 +127,38 @@ class VehicleFactory(object):
         # Random state
         self.random_state = np.random.RandomState(17502)
 
-    def generate(self, integrator_class, car_following_class, h, actual_speed=None):
-        maxspd = self.maxspd_rv.rvs(random_state=self.random_state)
-        # If we have no prescribed actual speed ...
+    def generate(self, integrator_class, car_following_class, h,
+                 vehicle_length=None,
+                 desired_speed=None, actual_speed=None,
+                 accel=None, decel=None,
+                 time_gap=None, space_gap=None):
+        # If we have no prescribed fixed desired (maximum) speed ...
+        if desired_speed is None:
+            # ... generate it randomly
+            desired_speed = self.maxspd_rv.rvs(random_state=self.random_state)
+        # If we have no prescribed fixed actual speed ...
         if actual_speed is None:
             # ... make sure that the vehicle does not exceed its preferred speed when entering the road
-            actual_speed = min(maxspd, self.speed_rv.rvs(random_state=self.random_state))
-        accel = self.accel_rv.rvs(random_state=self.random_state)
-        decel = self.decel_rv.rvs(random_state=self.random_state)
-        vehicle_length = self.length_rv.rvs(random_state=self.random_state)
-        tgap = self.tgap_rv.rvs(random_state=self.random_state)
-        sgap = self.sgap_rv.rvs(random_state=self.random_state)
-        cf_model = car_following_class(maxspd, sgap, tgap, accel, decel)
+            actual_speed = min(desired_speed, self.speed_rv.rvs(random_state=self.random_state))
+        if accel is None:
+            accel = self.accel_rv.rvs(random_state=self.random_state)
+        if decel is None:
+            decel = self.decel_rv.rvs(random_state=self.random_state)
+        if vehicle_length is None:
+            vehicle_length = self.length_rv.rvs(random_state=self.random_state)
+        if time_gap is None:
+            time_gap = self.tgap_rv.rvs(random_state=self.random_state)
+        if space_gap is None:
+            space_gap = self.sgap_rv.rvs(random_state=self.random_state)
+        #
+        cf_model = car_following_class(desired_speed, space_gap, time_gap, accel, decel)
         integrator = integrator_class.with_model_and_step(cf_model, h)
+        #
         self.next_vehicle_id += 1
+        #
+        panm_globals.LOGGER.debug('generating vehicle {:d}:'.format(self.next_vehicle_id))
+        panm_globals.LOGGER.debug('  v0={:f}, v={:f}, a={:f}, b={:f}'.format(desired_speed, actual_speed, accel, decel))
+        panm_globals.LOGGER.debug('  T={:f}, s0={:f}'.format(time_gap, space_gap))
+        panm_globals.LOGGER.debug('  l={:f}'.format(vehicle_length))
+        #
         return Vehicle(self.next_vehicle_id, vehicle_length, actual_speed, integrator)

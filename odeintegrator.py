@@ -19,6 +19,29 @@ class ODEIntegrator(object):
         return integrator
 
     def stopping_heuristics(self, yx: float, yv: float, dx: float, dv: float, h: float) -> tuple:
+        """
+        Heuristics for handling cases when the resulting speed of the iteration step would be negative. This may
+        easily happen due to leader vehicle stopping at signalized intersection or due to an accident etc., or the
+        follower vehicle being moved too close to a moving leader most often due to the integration step being
+        too large.
+
+        The original paper by Treiber and Varathanajan assumes a stopping distance approximately
+
+            x(t+h) = x(t) - 0.5 * v(t)^2/a(t)
+
+        (note that a(t) is negative and that by definition of the problem v(t+h) = a(t)). However, this assumes that
+        the vehicle is actually slowing down. Unfortunately, we have demonstrated that this kind of heuristics also
+        engages in the initial phase when a vehicle speeds up from a total stop and closely follows the leader.
+        In this case, some predictions in intermediate steps of an integration scheme "accidentally" project this
+        vehicle to be too close to its moving leader.
+
+        :param yx:
+        :param yv:
+        :param dx:
+        :param dv:
+        :param h:
+        :return:
+        """
         yvh = yv + h * dv
         if dv < 0 and yvh < 0:
             # Do not stop vehicles that are already stopped.
@@ -27,10 +50,11 @@ class ODEIntegrator(object):
                 yvh = 0.0
                 yxh = yx
                 panm_globals.LOGGER.debug(
-                    'yx = {:f}, yv = {:f}, dx = {:f}, dv = {:f} ..... already stopped vehicle has stopped?'.format(yx, yv, dx, dv))
+                    'yx = {:f}, yv = {:f}, dx = {:f}, dv = {:f} '
+                    '..... already stopped vehicle has stopped?'.format(yx, yv, dx, dv))
             else:
                 yxh_temp = yx + h * dx
-                yxh = yx - dx * dx / dv
+                yxh = yx - 0.5 * yv * yv / dv
                 panm_globals.LOGGER.debug(
                     'dv = {:f}, yvh = {:f} ..... projected position {:f}, forced stop'.format(dv, yvh, yxh_temp))
                 panm_globals.LOGGER.debug(
@@ -52,7 +76,9 @@ class ODEIntegrator(object):
     def initialize_state(self, x: float, v: float) -> tuple:
         raise NotImplementedError('create state method has to be implemented in child class')
 
-    def correct_state(self, vehicle_state_t: tuple, vehicle_state_th: tuple, leader_state_th: tuple, leader_length: float) -> tuple:
+    def correct_state(self,
+                      vehicle_state_t: tuple, vehicle_state_th: tuple, leader_state_th: tuple,
+                      leader_length: float) -> tuple:
         raise NotImplementedError('state checking method has to be implemented in child class')
 
     @staticmethod
@@ -60,8 +86,8 @@ class ODEIntegrator(object):
         yx, yv = state_t
         yxh, yvh = state_th
         if yxh < yx:
+            panm_globals.LOGGER.warn('yxh = {:f} < yx = {:f} ... yxh will be set to yx'.format(yxh, yx))
             yxh = yx
-            panm_globals.LOGGER.warn('yhx < yx')
         if yvh < 0.0:
             yvh = 0.0
             panm_globals.LOGGER.warn('yvh < 0.0')
@@ -83,6 +109,7 @@ class ODEIntegrator(object):
             yvh = 0.0
         #
         return yxh, yvh
+
 
 class EulerODEIntegrator(ODEIntegrator):
 
@@ -106,12 +133,15 @@ class EulerODEIntegrator(ODEIntegrator):
         yh = self.stopping_heuristics(yx, yv, dx1, dv1, self.h)
         return yh, th
 
-    def correct_state(self, vehicle_state_t: tuple, vehicle_state_th: tuple, leader_state_th: tuple, leader_length: float) -> tuple:
+    def correct_state(self,
+                      vehicle_state_t: tuple, vehicle_state_th: tuple, leader_state_th: tuple,
+                      leader_length: float) -> tuple:
         # For Euler integrator we do not have to decompose the vehicle states and so the
         # EulerODEIntegrator::_correct() mathod can be called directly.
         yxh, yvh = self._correct(vehicle_state_t, vehicle_state_th, leader_state_th, leader_length, self.model.s0)
         # It looks like overkill here, but the state tuple is more complex in higher-order methods
         return yxh, yvh, (yxh, yvh)
+
 
 class TrapezoidODEIntegrator(ODEIntegrator):
 
@@ -156,7 +186,9 @@ class TrapezoidODEIntegrator(ODEIntegrator):
         # assert vehicle_state_th[1] > 0
         return yh, th
 
-    def correct_state(self, vehicle_state_t: tuple, vehicle_state_th: tuple, leader_state_th: tuple, leader_length: float) -> tuple:
+    def correct_state(self,
+                      vehicle_state_t: tuple, vehicle_state_th: tuple, leader_state_th: tuple,
+                      leader_length: float) -> tuple:
         _, state_t = vehicle_state_t
         _, state_th = vehicle_state_th
         _, state_lth = leader_state_th
@@ -181,7 +213,7 @@ class RungeKutta4ODEIntegrator(ODEIntegrator):
 
     def update_state(self, vehicle_state: tuple, leader_state: tuple, leader_length: float, t: float) -> tuple:
         """
-        Update the vehicle state using explicit RK4 rule (Heun's method).
+        Update the vehicle state using explicit RK4 rule.
         :param vehicle_state: tuple of three states (the state at t-h, t-h/2 and the state at t)
         :param leader_state:  tuple of three leader vehicle states; as the leader vehicle has been updated already,
                               the leader state contains states at t, t+h/2 and at t+h
@@ -189,7 +221,7 @@ class RungeKutta4ODEIntegrator(ODEIntegrator):
         :param t: current time
         :return: a tuple of state information (2-tuple of states at t and t+h) and shifted time
         """
-        # Timing shows that decomposition of tuple into variables is faster than indexing...
+        # Timing shows that decomposition of tuple into variables is faster than indexing the tuple.
         *_, vehicle_state_t = vehicle_state
         yx, yv = vehicle_state_t
         leader_state_t, leader_state_th2, leader_state_th = leader_state
@@ -226,7 +258,8 @@ class RungeKutta4ODEIntegrator(ODEIntegrator):
         # I.e. y_th2 = y + h/4 * (k2+k3)
         panm_globals.LOGGER.debug('RK4 step 4 th2')
         vehicle_state_th2 = self.stopping_heuristics(yx, yv, k2x+k3x, k2v+k3v, 0.5*self.h2)
-        # vehicle_state_th  = (yx + self.h * (k1x + 2*k2x + 2*k3x + k4x) / 6.0, yv + self.h * (k1v + 2*k2v + 2*k3v + k4v) / 6.0)
+        # vehicle_state_th  = (yx + self.h * (k1x + 2*k2x + 2*k3x + k4x) / 6.0,
+        #                      yv + self.h * (k1v + 2*k2v + 2*k3v + k4v) / 6.0)
         panm_globals.LOGGER.debug('RK4 step 4 th')
         vehicle_state_th = self.stopping_heuristics(yx, yv, k1x+2*k2x+2*k3x+k4x, k1v + 2*k2v + 2*k3v + k4v, self.h/6)
         yh = vehicle_state_t, vehicle_state_th2, vehicle_state_th
@@ -234,7 +267,9 @@ class RungeKutta4ODEIntegrator(ODEIntegrator):
         # assert yh[1] > 0
         return yh, th
 
-    def correct_state(self, vehicle_state_t: tuple, vehicle_state_th: tuple, leader_state_th: tuple, leader_length: float) -> tuple:
+    def correct_state(self,
+                      vehicle_state_t: tuple, vehicle_state_th: tuple, leader_state_th: tuple,
+                      leader_length: float) -> tuple:
         *_, state_t = vehicle_state_t
         _, state_th2, state_th = vehicle_state_th
         _, state_lth2, state_lth = leader_state_th
@@ -266,5 +301,11 @@ class BallisticODEIntegrator(ODEIntegrator):
         th = t + self.h
         return yh, th
 
-    def correct_state(self, vehicle_state_t: tuple, vehicle_state_th: tuple, leader_back_x: tuple) -> tuple:
-        raise NotImplementedError('state checking method has to be implemented in child class')
+    def correct_state(self,
+                      vehicle_state_t: tuple, vehicle_state_th: tuple, leader_state_th: tuple,
+                      leader_length: float) -> tuple:
+        # As the Ballistic scheme is a variant of the Euler integrator, we do not have to decompose the vehicle
+        # states and so the BallisticODEIntegrator::_correct() method may be called directly.
+        yxh, yvh = self._correct(vehicle_state_t, vehicle_state_th, leader_state_th, leader_length, self.model.s0)
+        # It looks like overkill here, but the state tuple is more complex in higher-order methods
+        return yxh, yvh, (yxh, yvh)
