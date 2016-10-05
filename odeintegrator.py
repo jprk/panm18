@@ -4,12 +4,18 @@ import panm_globals
 
 class ODEIntegrator(object):
 
-    def __init__(self, h):
+    def __init__(self, h: float):
         self.model = None
         self.f = None
+        self.set_step(h)
+
+    def set_step(self, h: float) -> None:
         self.h = h
         self.h2 = 0.5*h
         self.hh2 = 0.5 * h * h  # for ballistic update
+
+    def get_step(self) -> float:
+        return self.h
 
     @classmethod
     def with_model_and_step(cls, cf_model: CarFollowingModel, h: float) -> None:
@@ -93,20 +99,21 @@ class ODEIntegrator(object):
             panm_globals.LOGGER.warn('yvh < 0.0')
         # Now handle the rare case when a vehicle "overshoots" the leader if the leader has been forced to stop
         # by the heuristics in update_state().
-        lxh, lvh = state_lth
-        leader_back_x = lxh - leader_length
-        if yxh + s0 >= leader_back_x + 1e-12:
-            # The vehicle is closer to the leader than acceptable. This will result in an attempt to reverse the
-            # vehicle movement in the next integration step.
-            yxh = leader_back_x - s0
-            if yxh < yx:
-                # Our vehicle wants to reverse anyway, this is bad
-                panm_globals.LOGGER.error('irreversible vehicle overshot')
-                yxh = yx
-            if lvh > 0.0:
-                # Overshot leader vehicle that is still moving
-                panm_globals.LOGGER.error('overshot moving leader vehicle')
-            yvh = 0.0
+        if state_lth is not None:
+            lxh, lvh = state_lth
+            leader_back_x = lxh - leader_length
+            if yxh + s0 >= leader_back_x + 1e-12:
+                # The vehicle is closer to the leader than acceptable. This will result in an attempt to reverse the
+                # vehicle movement in the next integration step.
+                yxh = leader_back_x - s0
+                if yxh < yx:
+                    # Our vehicle wants to reverse anyway, this is bad
+                    panm_globals.LOGGER.error('irreversible vehicle overshot')
+                    yxh = yx
+                if lvh > 0.0:
+                    # Overshot leader vehicle that is still moving
+                    panm_globals.LOGGER.error('overshot moving leader vehicle')
+                yvh = 0.0
         #
         return yxh, yvh
 
@@ -122,25 +129,44 @@ class EulerODEIntegrator(ODEIntegrator):
         return 1
 
     def initialize_state(self, x: float, v: float) -> tuple:
-        # The state vector for first order method has just the current state values and the "future" value at t+h
-        return x, v
+        # The state vector for first order method has to incorporate the "future" state value at t+h as well
+        # so that the state usage is consistent for all methods
+        return (x, v), (x, v)
 
-    def update_state(self, vehicle_state: tuple, leader_state: tuple, leader_length: float, t: float) -> tuple:
+    def update_state(self, vehicle_state: tuple, leader_state: tuple or None, leader_length: float, t: float) -> tuple:
+        """
+        Update the vehicle state using explicit Euler method.
+        :param vehicle_state: tuple of two states (the state at t-h and the state at t)
+        :param leader_state:  tuple of two leader vehicle states; as the leader vehicle has been updated already,
+                              the leader state contains states at t and at t+h
+        :param leader_length: the length of the leader vehicle
+        :param t: current time
+        :return: a tuple of state information (2-tuple of states at t and t+h) and shifted time
+        """
         # Timing shows that decomposition of tuple into variables is faster than indexing...
-        yx, yv = vehicle_state
-        dx1, dv1 = self.f(vehicle_state, leader_state, leader_length, t)
+        *_, vehicle_state_t = vehicle_state
+        yx, yv = vehicle_state_t
+        leader_state_t, leader_state_th = leader_state
+        dx1, dv1 = self.f(vehicle_state_t, leader_state_t, leader_length, t)
         th = t + self.h
-        yh = self.stopping_heuristics(yx, yv, dx1, dv1, self.h)
+        vehicle_state_th = self.stopping_heuristics(yx, yv, dx1, dv1, self.h)
+        yh = vehicle_state_t, vehicle_state_th
         return yh, th
 
     def correct_state(self,
-                      vehicle_state_t: tuple, vehicle_state_th: tuple, leader_state_th: tuple,
+                      vehicle_state_t: tuple, vehicle_state_th: tuple, leader_state_th: tuple or None,
                       leader_length: float) -> tuple:
-        # For Euler integrator we do not have to decompose the vehicle states and so the
-        # EulerODEIntegrator::_correct() mathod can be called directly.
-        yxh, yvh = self._correct(vehicle_state_t, vehicle_state_th, leader_state_th, leader_length, self.model.s0)
+        # Although the Euler integrator is of the first order, we still have to decompose the vehicle states
+        # as the state has to cover both steps `t` and `t+h`.
+        _, state_t = vehicle_state_t
+        _, state_th = vehicle_state_th
+        if leader_state_th is not None:
+            _, state_lth = leader_state_th
+        else:
+            state_lth = None
+        yxh, yvh = self._correct(state_t, state_th, state_lth, leader_length, self.model.s0)
         # It looks like overkill here, but the state tuple is more complex in higher-order methods
-        return yxh, yvh, (yxh, yvh)
+        return yxh, yvh, (state_t, (yxh, yvh))
 
 
 class TrapezoidODEIntegrator(ODEIntegrator):
@@ -225,21 +251,26 @@ class RungeKutta4ODEIntegrator(ODEIntegrator):
         *_, vehicle_state_t = vehicle_state
         yx, yv = vehicle_state_t
         leader_state_t, leader_state_th2, leader_state_th = leader_state
+        # First approximation of the derivative
         k1x, k1v = self.f(vehicle_state_t, leader_state_t, leader_length, t)
-        # Temporary position for the second sample
-        # yt = (yx + self.h2 * k1x, yv + self.h2 * k1v)
-        panm_globals.LOGGER.debug('RK4 step 1')
+        # The second sample is located at the midpoint of the interval using the first order approximation
+        # of the derivative
+        # y_pred1 = (yx + k1x * self.h2, yv + k1v * self.h2)
+        # panm_globals.LOGGER.debug('RK4 step 1')
+        # This is the first estimate of the state at the midpoint
         y_pred1 = self.stopping_heuristics(yx, yv, k1x, k1v, self.h2)
+        # Second approximation of the derivative
         k2x, k2v = self.f(y_pred1, leader_state_th2, leader_length, t + self.h2)
-        # Temporary position for the third sample
-        # yt = (yx + self.h2 * k2x, yv + self.h2 * k2v)
-        panm_globals.LOGGER.debug('RK4 step 2')
+        # The second sample is located again at the midpoint of the interval
+        # y_pred2 = (yx + k2x * self.h2, yv +  k2v * self.h2)
+        # panm_globals.LOGGER.debug('RK4 step 2')
         y_pred2 = self.stopping_heuristics(yx, yv, k2x, k2v, self.h2)
         k3x, k3v = self.f(y_pred2, leader_state_th2, leader_length, t + self.h2)
         # Temporary position for the fourth sample
         # yt = (yx + self.h * k3x, yv + self.h * k3v)
-        panm_globals.LOGGER.debug('RK4 step 3')
+        # panm_globals.LOGGER.debug('RK4 step 3')
         y_pred3 = self.stopping_heuristics(yx, yv, k3x, k3v, self.h)
+        # This construc catches the assertion that used to occur during the computation of the fourth approximation
         try:
             k4x, k4v = self.f(y_pred3, leader_state_th, leader_length, t + self.h)
         except AssertionError:
@@ -256,12 +287,14 @@ class RungeKutta4ODEIntegrator(ODEIntegrator):
         th = t + self.h
         # TODO: This it just a wild guess ... the x and v at time h/2 is the average of "middle" samples from RK4.
         # I.e. y_th2 = y + h/4 * (k2+k3)
-        panm_globals.LOGGER.debug('RK4 step 4 th2')
-        vehicle_state_th2 = self.stopping_heuristics(yx, yv, k2x+k3x, k2v+k3v, 0.5*self.h2)
+        # panm_globals.LOGGER.debug('RK4 step 4 th2')
+        # vehicle_state_th2 = self.stopping_heuristics(yx, yv, k2x+k3x, k2v+k3v, 0.5*self.h2)
+        vehicle_state_th2 = self.stopping_heuristics(yx, yv, k1x+k2x, k1v+k2v, 0.5*self.h2)
+        # vehicle_state_th2 = self.stopping_heuristics(yx, yv, k1x+2*k2x+2*k3x+k4x, k1v+2*k2v+2*k3v+k4v, self.h2/6)
         # vehicle_state_th  = (yx + self.h * (k1x + 2*k2x + 2*k3x + k4x) / 6.0,
         #                      yv + self.h * (k1v + 2*k2v + 2*k3v + k4v) / 6.0)
-        panm_globals.LOGGER.debug('RK4 step 4 th')
-        vehicle_state_th = self.stopping_heuristics(yx, yv, k1x+2*k2x+2*k3x+k4x, k1v + 2*k2v + 2*k3v + k4v, self.h/6)
+        # panm_globals.LOGGER.debug('RK4 step 4 th')
+        vehicle_state_th = self.stopping_heuristics(yx, yv, k1x+2*k2x+2*k3x+k4x, k1v+2*k2v+2*k3v+k4v, self.h/6)
         yh = vehicle_state_t, vehicle_state_th2, vehicle_state_th
         # assert yh[0] > 0
         # assert yh[1] > 0
@@ -289,23 +322,35 @@ class BallisticODEIntegrator(ODEIntegrator):
         return 1
 
     def initialize_state(self, x: float, v: float) -> tuple:
-        # The state vector for ballistic methods is the same as for a first order method - it contains just
-        # the current state values
-        return x, v
+        # The state vector for a first order method has to incorporate the "future" state value at `t+h` as well
+        # so that the state usage is consistent for all methods regardless of their order.
+        return (x, v), (x, v)
 
     def update_state(self, vehicle_state: tuple, leader_state: tuple, leader_length: float, t: float) -> tuple:
+        """
+        Update the vehicle state using explicit Euler method.
+        :param vehicle_state: tuple of two states (the state at t-h and the state at t)
+        :param leader_state:  tuple of two leader vehicle states; as the leader vehicle has been updated already,
+                              the leader state contains states at t and at t+h
+        :param leader_length: the length of the leader vehicle
+        :param t: current time
+        :return: a tuple of state information (2-tuple of states at t and t+h) and shifted time
+        """
         # Timing shows that decomposition of tuple into variables is faster than indexing...
-        yx, yv = vehicle_state
-        k1x, k1v = self.f(vehicle_state, leader_state, leader_length, t)
-        yh = (yx + self.h * yv + self.hh2 * k1v, yv + self.h * k1v)
+        *_, vehicle_state_t = vehicle_state
+        yx, yv = vehicle_state_t
+        leader_state_t, leader_state_th = leader_state
+        k1x, k1v = self.f(vehicle_state_t, leader_state_t, leader_length, t)
+        vehicle_state_th = (yx + self.h * yv + self.hh2 * k1v, yv + self.h * k1v)
         th = t + self.h
+        yh = vehicle_state_t, vehicle_state_th
         return yh, th
 
     def correct_state(self,
                       vehicle_state_t: tuple, vehicle_state_th: tuple, leader_state_th: tuple,
                       leader_length: float) -> tuple:
-        # As the Ballistic scheme is a variant of the Euler integrator, we do not have to decompose the vehicle
-        # states and so the BallisticODEIntegrator::_correct() method may be called directly.
-        yxh, yvh = self._correct(vehicle_state_t, vehicle_state_th, leader_state_th, leader_length, self.model.s0)
-        # It looks like overkill here, but the state tuple is more complex in higher-order methods
-        return yxh, yvh, (yxh, yvh)
+        _, state_t = vehicle_state_t
+        _, state_th = vehicle_state_th
+        _, state_lth = leader_state_th
+        yxh, yvh = self._correct(state_t, state_th, state_lth, leader_length, self.model.s0)
+        return yxh, yvh, (state_t, (yxh, yvh))
